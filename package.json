@@ -1,0 +1,29 @@
+{
+  "name": "oo-editors",
+  "version": "1.0.12",
+  "main": "server.js",
+  "scripts": {
+    "start": "bun download-converter.js && bun scripts/build_allfontsgen.js && cross-env FONT_DATA_DIR=assets/onlyoffice-fontdata bun ./scripts/generate_office_fonts.js && cross-env FONT_DATA_DIR=assets/onlyoffice-fontdata bun server.js",
+    "server": "cross-env FONT_DATA_DIR=assets/onlyoffice-fontdata node server.js",
+    "test": "bun run test:unit && bun run test:e2e",
+    "test:all": "bun run test:unit && bun run test:e2e",
+    "test:unit": "bun test __tests__/server-utils.test.js __tests__/desktop-stub-utils.test.js && node test-url-scheme.js",
+    "test:e2e": "bun run test:console-batch && bun run test:save",
+    "test:console-batch": "node test-console-batch.js",
+    "test:save": "bun test __tests__/save.test.js",
+    "build": "cd sdkjs/build && npm install && npx grunt --desktop=true && cd ../.. && for e in cell word slide visio; do mkdir -p editors/sdkjs/$e && cp sdkjs/deploy/sdkjs/$e/sdk-all.js editors/sdkjs/$e/ && cp sdkjs/deploy/sdkjs/$e/sdk-all-min.js editors/sdkjs/$e/; done",
+    "build:minify": "bunx esbuild server.js --minify --outfile=dist/server.js"
+  },
+  "dependencies": {
+    "compression": "^1.8.1",
+    "express": "^4.18.2",
+    "xlsx": "^0.18.5"
+  },
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "cross-env": "^7.0.3",
+    "grunt-cli": "^1.5.0",
+    "playwright": "^1.56.1"
+  }
+}

@@ -1,0 +1,214 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Run unit tests
+        run: bun run test:unit
+
+  version-bump:
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.bump.outputs.version }}
+      tag: ${{ steps.bump.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Bump version
+        id: bump
+        run: |
+          npm version patch --no-git-tag-version
+          VERSION=$(node -p "require('./package.json').version")
+          sed -i "s/var APP_VERSION = '.*'/var APP_VERSION = '$VERSION'/" editors/desktop-stub.js
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "tag=v$VERSION" >> $GITHUB_OUTPUT
+          git add package.json editors/desktop-stub.js
+          git commit -m "chore: bump version to $VERSION [skip ci]"
+          git tag "v$VERSION"
+          git push origin main --tags
+
+  build-sdk:
+    needs: version-bump
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version-bump.outputs.tag }}
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Cache SDK build
+        id: sdk-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            editors/sdkjs/cell/sdk-all.js
+            editors/sdkjs/cell/sdk-all-min.js
+            editors/sdkjs/word/sdk-all.js
+            editors/sdkjs/word/sdk-all-min.js
+            editors/sdkjs/slide/sdk-all.js
+            editors/sdkjs/slide/sdk-all-min.js
+            editors/sdkjs/visio/sdk-all.js
+            editors/sdkjs/visio/sdk-all-min.js
+          key: sdk-build-${{ hashFiles('sdkjs/common/**/*.js', 'sdkjs/cell/**/*.js', 'sdkjs/word/**/*.js', 'sdkjs/slide/**/*.js', 'sdkjs/visio/**/*.js', 'sdkjs/build/Gruntfile.js') }}
+
+      - name: Build SDK
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        run: bun run build
+
+      - name: Upload SDK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdk-build
+          path: |
+            editors/sdkjs/cell/sdk-all.js
+            editors/sdkjs/cell/sdk-all-min.js
+            editors/sdkjs/word/sdk-all.js
+            editors/sdkjs/word/sdk-all-min.js
+            editors/sdkjs/slide/sdk-all.js
+            editors/sdkjs/slide/sdk-all-min.js
+            editors/sdkjs/visio/sdk-all.js
+            editors/sdkjs/visio/sdk-all-min.js
+
+  build:
+    needs: [version-bump, build-sdk]
+    strategy:
+      matrix:
+        include:
+          - os: macos-14
+            platform: darwin-arm64
+            zip_name: oo-editors-darwin-arm64.zip
+          - os: macos-15-intel
+            platform: darwin-x64
+            zip_name: oo-editors-darwin-x64.zip
+          - os: windows-latest
+            platform: windows-x64
+            zip_name: oo-editors-windows-x64.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version-bump.outputs.tag }}
+
+      - name: Setup bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Download SDK build
+        uses: actions/download-artifact@v4
+        with:
+          name: sdk-build
+          path: editors/sdkjs
+
+      - name: Cache converter
+        uses: actions/cache@v4
+        with:
+          path: converter
+          key: converter-${{ runner.os }}-${{ runner.arch }}-v9.1.0
+
+      - name: Download converter
+        run: bun download-converter.js
+
+      - name: Build allfontsgen
+        run: bun scripts/build_allfontsgen.js
+
+      - name: Install production dependencies
+        run: bun install --production
+
+      - name: Create release bundle (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p bundle
+          bunx esbuild server.js --bundle --platform=node --minify --outfile=bundle/server.js
+          cp package.json bundle/
+          cp -r node_modules bundle/
+          cp -r converter bundle/
+          cp -r editors bundle/
+          mkdir -p bundle/scripts
+          cp scripts/generate_office_fonts.js bundle/scripts/
+          mkdir -p bundle/assets/onlyoffice-fontdata
+          cd bundle && zip -r ../${{ matrix.zip_name }} .
+
+      - name: Create release bundle (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path bundle
+          bunx esbuild server.js --bundle --platform=node --minify --outfile=bundle/server.js
+          Copy-Item package.json -Destination bundle/
+          Copy-Item -Recurse node_modules bundle/
+          Copy-Item -Recurse converter bundle/
+          Copy-Item -Recurse editors bundle/
+          New-Item -ItemType Directory -Force -Path bundle/scripts
+          Copy-Item scripts/generate_office_fonts.js -Destination bundle/scripts/
+          New-Item -ItemType Directory -Force -Path bundle/assets/onlyoffice-fontdata
+          Compress-Archive -Path bundle/* -DestinationPath ${{ matrix.zip_name }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.zip_name }}
+          path: ${{ matrix.zip_name }}
+
+  release:
+    needs: [version-bump, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: oo-editors-*
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version-bump.outputs.tag }}
+          name: Release ${{ needs.version-bump.outputs.version }}
+          body: |
+            ## Downloads
+
+            | Platform | Download |
+            |----------|----------|
+            | macOS ARM64 (Apple Silicon) | `oo-editors-darwin-arm64.zip` |
+            | macOS x64 (Intel) | `oo-editors-darwin-x64.zip` |
+            | Windows x64 | `oo-editors-windows-x64.zip` |
+
+            ## First Run
+
+            1. Extract the zip
+            2. Run `node server.js` (requires Node.js)
+            3. Font metadata will be generated on first launch
+          files: |
+            artifacts/*.zip

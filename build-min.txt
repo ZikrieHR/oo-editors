@@ -1,0 +1,171 @@
+ONLYOFFICE sdkjs Build Pipeline
+================================
+
+Tool: Google Closure Compiler (native binary, no Java required on macOS arm64)
+Orchestrator: Grunt (via bunx)
+Working directory: sdkjs/build/
+
+
+PREREQUISITES
+-------------
+Node modules must be installed in sdkjs/build/:
+  cd sdkjs/build && bun install
+
+
+OUTPUT STRUCTURE
+----------------
+Each editor (cell, word, slide, visio) produces TWO code-split chunks:
+
+  sdk-all-min.js   Base chunk. Core API, defines, base classes.
+                   Compiled from config["min"] file list.
+                   Standalone (no dependencies).
+
+  sdk-all.js       Dependent chunk. Bulk implementation (drawings, formulas, etc).
+                   Compiled from config["common"] file list.
+                   Depends on sdk-all-min.js at runtime.
+
+Both chunks are compiled at the same optimization level. The "-min" suffix
+means "minimum/core code", NOT "minified version of sdk-all.js".
+
+Config file lists: sdkjs/configs/{cell,word,slide,visio}.json
+Output directory:  sdkjs/deploy/sdkjs/{cell,word,slide,visio}/
+
+
+BUILD COMMANDS
+--------------
+
+1. Full production build (all editors + auxiliary files):
+
+   cd sdkjs/build
+   bunx grunt --desktop=true
+
+   This runs: clean-deploy -> compile-sdk -> copy-other
+   Compilation level: ADVANCED (variable renaming, dead code elimination, inlining)
+   Includes desktop-mode files: common/Local/common.js, {editor}/Local/api.js
+
+
+2. Single editor build (faster iteration):
+
+   cd sdkjs/build
+   bunx grunt compile-cell --desktop=true
+   bunx grunt compile-word --desktop=true
+   bunx grunt compile-slide --desktop=true
+   bunx grunt compile-visio --desktop=true
+
+
+3. Debuggable build (readable output, no variable renaming):
+
+   cd sdkjs/build
+   bunx grunt --desktop=true --level=WHITESPACE_ONLY --formatting=PRETTY_PRINT
+
+
+4. Build with source maps:
+
+   cd sdkjs/build
+   bunx grunt --desktop=true --map
+
+
+5. Build with addons (sdkjs-forms, sdkjs-ooxml):
+
+   cd sdkjs/build
+   bunx grunt --desktop=true --addon=sdkjs-forms --addon=sdkjs-ooxml
+
+
+SYNC TO editors/sdkjs/
+-----------------------
+
+After building, copy the SDK bundles from deploy to the runtime directory:
+
+   cp sdkjs/deploy/sdkjs/cell/sdk-all-min.js  editors/sdkjs/cell/
+   cp sdkjs/deploy/sdkjs/cell/sdk-all.js       editors/sdkjs/cell/
+   cp sdkjs/deploy/sdkjs/word/sdk-all-min.js   editors/sdkjs/word/
+   cp sdkjs/deploy/sdkjs/word/sdk-all.js       editors/sdkjs/word/
+   cp sdkjs/deploy/sdkjs/slide/sdk-all-min.js  editors/sdkjs/slide/
+   cp sdkjs/deploy/sdkjs/slide/sdk-all.js      editors/sdkjs/slide/
+   cp sdkjs/deploy/sdkjs/visio/sdk-all-min.js  editors/sdkjs/visio/
+   cp sdkjs/deploy/sdkjs/visio/sdk-all.js      editors/sdkjs/visio/
+
+DO NOT overwrite these hand-patched files in editors/sdkjs/:
+  - common/Local/common.js    (custom HTTP/browser patches for oo-editors)
+  - common/AllFonts.js        (generated font metadata, served dynamically)
+  - common/Images/local/      (local image assets)
+  - slide/themes/             (presentation themes)
+
+
+AUXILIARY FILES
+---------------
+
+The default grunt task also runs "copy-other" which builds/copies:
+  - common/Drawings/Format/path-boolean-min.js  (WHITESPACE_ONLY compiled)
+  - common/Charts/ChartStyles.js
+  - common/Native/*.js
+  - common/libfont/engine/*.js
+  - common/spell/spell/*.js
+  - common/hash/hash/*.js
+  - common/zlib/engine/*.js
+  - common/serviceworker/*.js
+  - common/SmartArts/**
+  - common/Images/**
+  - cell/css/*.css
+  - slide/themes/**
+  - pdf/src/engine/*.js, *.wasm, *.bin
+  - pdf/src/annotations/stamps/*.json
+
+These go to sdkjs/deploy/sdkjs/common/ (and pdf/, cell/css/, slide/themes/).
+
+
+EDIT-BUILD-TEST WORKFLOW
+------------------------
+
+1. Edit source files in sdkjs/ (the submodule).
+   Source files are listed in sdkjs/configs/{cell,word,slide,visio}.json
+   under "min" and "common" arrays.
+
+2. Build the affected editor:
+   cd sdkjs/build && bunx grunt compile-cell --desktop=true
+
+3. Copy output to editors/sdkjs/:
+   cp sdkjs/deploy/sdkjs/cell/sdk-all-min.js editors/sdkjs/cell/
+   cp sdkjs/deploy/sdkjs/cell/sdk-all.js editors/sdkjs/cell/
+
+4. Start server and test:
+   bun run server
+
+5. Open browser to http://localhost:8080/open?filepath=/path/to/file.xlsx
+
+
+RUNTIME LOADING
+---------------
+
+The web-apps app.js files hardcode "sdk-all-min" in require.js paths:
+  Spreadsheet: sdk: "../../sdkjs/cell/sdk-all-min"
+  Document:    sdk: "../../sdkjs/word/sdk-all-min"
+  Presentation: sdk: "../../sdkjs/slide/sdk-all-min"
+
+sdk-all-min.js loads first (base chunk), then sdk-all.js loads as its dependency.
+common/Local/common.js is injected separately after editor init.
+
+
+COMPILATION LEVELS REFERENCE
+-----------------------------
+
+  ADVANCED          Full optimization. Variable/property renaming, dead code
+                    elimination, function inlining. Not human-readable.
+                    Default. Use for production.
+
+  WHITESPACE_ONLY   Removes whitespace/comments only. Preserves all variable
+                    names. Use with --formatting=PRETTY_PRINT for debugging.
+
+  SIMPLE            (Available but not used by this project.)
+                    Basic optimization without renaming.
+
+
+CLOSURE COMPILER FLAGS (set automatically)
+------------------------------------------
+
+  --language_out=ECMASCRIPT5
+  --rewrite_polyfills=true
+  --warning_level=QUIET
+  --define=window.AscCommon.g_cCompanyName='Ascensio System SIA'
+  --define=window.AscCommon.g_cProductVersion='<version>'
+  --define=window.AscCommon.g_cBuildNumber='<build>'

@@ -1,0 +1,952 @@
+<!DOCTYPE html>
+<!--
+NOTE(victor): DOCUMENT LOADING ARCHITECTURE
+============================================
+This loader orchestrates ONLYOFFICE SDK initialization for browser-based editing.
+
+LOADING SEQUENCE:
+1. Fetch document binary via /api/convert (x2t converts to ONLYOFFICE format)
+2. Store binary in window._currentDocumentBinary
+3. Create DocsAPI editor (loads SDK in iframe)
+4. Wait for Asc.asc_docs_api to exist (SDK FULLY initialized)
+5. Inject common.js into iframe (patches SDK for local/browser operation)
+6. SDK calls LocalStartOpen() when ready -> triggers document load
+
+CRITICAL: Wait for Asc.asc_docs_api, NOT just AscCommon
+===========================================================
+AscCommon is created early during SDK load, but asc_docs_api (the editor API
+class) is created later. If we inject common.js when only AscCommon exists:
+- common.js starts waiting for AscCommon.baseEditorsApi (doesn't exist yet)
+- waitForPath() polls for 10+ seconds until SDK finishes loading
+- This causes massive delays (was 30s before fix)
+
+FIX (2026-02): Changed SDK readiness check from:
+  BAD:  iframeWindow.AscCommon (exists early, SDK incomplete)
+  GOOD: iframeWindow.Asc.asc_docs_api (exists when SDK is ready)
+
+The asc_docs_api class exists in ALL SDK types (word, cell, slide, visio).
+
+See common.js and desktop-stub.js headers for related documentation.
+-->
+<html>
+<head>
+    <title>ONLYOFFICE Offline Loader</title>
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=IE8"/>
+    <meta name="description" content="" />
+    <meta name="keywords" content="" />
+
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-touch-fullscreen" content="yes">
+
+    <style type="text/css">
+        html {
+            height: 100%;
+        }
+
+        body {
+            height: 100%;
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            font-family: Arial, sans-serif;
+        }
+
+        #wrap {
+            position:absolute;
+            left:0;
+            top:0;
+            right:0;
+            bottom:0;
+        }
+
+        #loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            text-align: center;
+            font-size: 18px;
+            color: #444;
+        }
+
+        #placeholder {
+            width: 100%;
+            height: 100%;
+        }
+
+        /* CSS-based hiding removed - using JavaScript only to avoid hiding the editor */
+    </style>
+
+    <link rel="preload" as="script" href="/web-apps/apps/api/documents/api.js">
+    <link rel="preload" as="script" href="/sdkjs/common/Local/common.js">
+    <link rel="preload" as="fetch" href="/sdkjs/common/libfont/engine/fonts.wasm" crossorigin>
+    <link rel="preload" as="script" href="/sdkjs/common/AllFonts.js">
+</head>
+<body>
+    <div id="wrap">
+        <div id="loading">Loading document...</div>
+        <div id="placeholder" style="display:none;"></div>
+    </div>
+
+    <!-- Desktop stub will be injected by server middleware -->
+
+    <!-- Load the main API first -->
+    <script type="text/javascript" src="/web-apps/apps/api/documents/api.js"></script>
+
+    <!-- NOTE: common.js will be loaded dynamically after the editor initializes -->
+    <!-- because it depends on AscCommon being available -->
+
+    <script>
+        (function() {
+            const PERF = {
+                loaderStart: performance.now(),
+                fetchStart: null,
+                fetchEnd: null,
+                docEditorCreated: null,
+                appReady: null,
+                waitForSdkStart: null,
+                commonJsLoadStart: null,
+                commonJsLoadEnd: null,
+                documentEndLoadCalled: null,
+                documentReady: null
+            };
+            window._PERF = PERF;
+
+            function logTimings() {
+                const t = PERF;
+                const breakdown = {
+                    total: t.documentReady ? (t.documentReady - t.loaderStart).toFixed(0) : 'N/A',
+                    fetch: t.fetchEnd ? (t.fetchEnd - t.fetchStart).toFixed(0) : 'N/A',
+                    docEditorCreate: t.docEditorCreated ? (t.docEditorCreated - t.fetchEnd).toFixed(0) : 'N/A',
+                    waitForAppReady: t.appReady ? (t.appReady - t.docEditorCreated).toFixed(0) : 'N/A',
+                    sdkWaitDelay: t.commonJsLoadStart ? (t.commonJsLoadStart - t.waitForSdkStart).toFixed(0) : 'N/A',
+                    commonJsLoad: t.commonJsLoadEnd ? (t.commonJsLoadEnd - t.commonJsLoadStart).toFixed(0) : 'N/A',
+                    documentLoad: t.documentReady && t.documentEndLoadCalled ? (t.documentReady - t.documentEndLoadCalled).toFixed(0) : 'N/A'
+                };
+                console.log('[TIMING] Client-side breakdown (ms):', JSON.stringify(breakdown, null, 2));
+                return breakdown;
+            }
+            window._logTimings = logTimings;
+
+            // Server configuration
+            const SERVER_PORT = 8080;
+            const SERVER_BASE_URL = 'http://localhost:' + SERVER_PORT;
+            window._ONLYOFFICE_SERVER_BASE_URL = SERVER_BASE_URL;
+            window._ONLYOFFICE_DOC_BASE_URL = null;
+            window._ONLYOFFICE_FILE_HASH = null;
+
+            console.log('=== OFFLINE LOADER STARTING ===');
+
+            // ========================================================================
+            // DIALOG DISMISSAL - Click "Got it" buttons to properly dismiss dialogs
+            // This runs periodically but tracks what it's already dismissed
+            // ========================================================================
+            var dismissedDialogs = new Set();
+
+            function dismissDialogsOnce() {
+                try {
+                    // Dismiss dialogs in iframe
+                    var iframe = document.querySelector('iframe[id*="placeholder"]') ||
+                                document.querySelector('iframe[id*="frameEditor"]') ||
+                                document.querySelector('iframe');
+
+                    if (iframe && iframe.contentWindow && iframe.contentDocument) {
+                        var iframeDoc = iframe.contentDocument;
+
+                        // Find and click "Got it" buttons ONCE
+                        iframeDoc.querySelectorAll('button').forEach(function(btn) {
+                            var text = (btn.textContent || btn.innerText || '').trim().toLowerCase();
+                            if ((text === 'got it' || text === 'ok') && !btn.dataset.dismissed) {
+                                console.log('[DISMISS] Clicking button:', text);
+                                btn.click();
+                                btn.dataset.dismissed = 'true';
+                            }
+                        });
+                    }
+                } catch(e) {
+                    // Silently fail
+                }
+            }
+
+            // Run dialog dismissal every 2 seconds (much less aggressive)
+            console.log('[DISMISS] Starting dialog dismissal checker');
+            setInterval(dismissDialogsOnce, 2000);
+            // ========================================================================
+
+            // Parse URL parameters
+            function getUrlParams() {
+                var e,
+                    a = /\+/g,  // Regex for replacing addition symbol with a space
+                    r = /([^&=]+)=?([^&]*)/g,
+                    d = function (s) { return decodeURIComponent(s.replace(a, " ")); },
+                    q = window.location.search.substring(1),
+                    urlParams = {};
+
+                while (e = r.exec(q))
+                    urlParams[d(e[1])] = d(e[2]);
+
+                return urlParams;
+            }
+
+            var urlParams = getUrlParams();
+            var filepath = urlParams['filepath'];
+
+            // ========================================================================
+            // SCROLL POSITION PERSISTENCE
+            // Parses scroll params from URL and restores position after document load
+            // ========================================================================
+            function parseScrollParams(params, editorType) {
+                if (!params) return null;
+                switch (editorType) {
+                    case 'cell':
+                        if (params.cell) {
+                            return {
+                                type: 'cell',
+                                cell: params.cell,
+                                sheet: params.sheet ? parseInt(params.sheet, 10) : 0
+                            };
+                        }
+                        break;
+                    case 'word':
+                        if (params.page) {
+                            return {
+                                type: 'page',
+                                page: parseInt(params.page, 10)
+                            };
+                        }
+                        break;
+                    case 'slide':
+                        if (params.slide) {
+                            return {
+                                type: 'slide',
+                                slide: parseInt(params.slide, 10)
+                            };
+                        }
+                        break;
+                }
+                return null;
+            }
+
+            function serializeScrollParams(scrollState) {
+                if (!scrollState) return '';
+                switch (scrollState.type) {
+                    case 'cell':
+                        var p = 'cell=' + encodeURIComponent(scrollState.cell);
+                        if (scrollState.sheet !== undefined && scrollState.sheet !== 0) {
+                            p += '&sheet=' + scrollState.sheet;
+                        }
+                        return p;
+                    case 'page':
+                        return 'page=' + scrollState.page;
+                    case 'slide':
+                        return 'slide=' + scrollState.slide;
+                    default:
+                        return '';
+                }
+            }
+
+            function updateUrlWithScroll(scrollState) {
+                if (!scrollState) return;
+                var url = new URL(window.location.href);
+                // Remove old scroll params
+                url.searchParams.delete('cell');
+                url.searchParams.delete('sheet');
+                url.searchParams.delete('page');
+                url.searchParams.delete('slide');
+                // Add new scroll params
+                switch (scrollState.type) {
+                    case 'cell':
+                        url.searchParams.set('cell', scrollState.cell);
+                        if (scrollState.sheet !== undefined && scrollState.sheet !== 0) {
+                            url.searchParams.set('sheet', scrollState.sheet.toString());
+                        }
+                        break;
+                    case 'page':
+                        url.searchParams.set('page', scrollState.page.toString());
+                        break;
+                    case 'slide':
+                        url.searchParams.set('slide', scrollState.slide.toString());
+                        break;
+                }
+                window.history.replaceState({}, '', url.toString());
+            }
+
+            // Store scroll state to restore after document ready
+            var pendingScrollState = null;
+
+            // Validate that filepath is provided
+            if (!filepath) {
+                document.getElementById('loading').innerHTML = 'Error: filepath parameter is required';
+                console.error('[LOADER] filepath parameter is missing!');
+                return;
+            }
+
+            var filename = urlParams['title'] || filepath.split('/').pop();
+            var fileExt = urlParams['filetype'] || filename.split('.').pop();
+            var key = urlParams['key'] || ('key-' + Date.now());
+
+            // Store filename and filepath globally so desktop-stub.js can access it
+            window._ONLYOFFICE_FILENAME = filename;
+            window._ONLYOFFICE_FILEPATH = filepath;
+            console.log('Filename:', filename);
+            console.log('Filepath:', filepath);
+            console.log('Stored in window._ONLYOFFICE_FILENAME:', window._ONLYOFFICE_FILENAME);
+            console.log('Stored in window._ONLYOFFICE_FILEPATH:', window._ONLYOFFICE_FILEPATH);
+            console.log('File extension:', fileExt);
+
+            // Determine document type - support 'doctype' parameter
+            var doctype = urlParams['doctype'] || 'cell';
+            if (!urlParams['doctype']) {
+                if (fileExt === 'docx' || fileExt === 'doc') {
+                    doctype = 'word';
+                } else if (fileExt === 'pptx' || fileExt === 'ppt') {
+                    doctype = 'slide';
+                }
+            }
+
+            console.log('Document type:', doctype);
+
+            // Parse scroll state from URL params
+            pendingScrollState = parseScrollParams(urlParams, doctype);
+            if (pendingScrollState) {
+                console.log('[SCROLL] Pending scroll restoration:', JSON.stringify(pendingScrollState));
+            }
+
+            function getDocumentData(urlParams) {
+                let docparams = {
+                    key: key,
+                    url: '_offline_',  // Special marker for offline mode
+                    title: filename,
+                    fileType: fileExt,
+                    permissions: {
+                        edit: true,
+                        download: true
+                    }
+                };
+
+                if (urlParams['mode'] == 'review')
+                    docparams.permissions.edit = !(docparams.permissions.review = true);
+
+                if (urlParams['isForm'] !== undefined)
+                    docparams.isForm = (urlParams['isForm']==='true');
+
+                return docparams;
+            }
+
+            function getEditorConfig(urlParams) {
+                return {
+                    customization   : {
+                        goback: { url: "onlyoffice.com" },
+                        feedback: false,  // Disable feedback
+                        forcesave: false,  // Disable forcesave
+                        help: false,  // Disable help
+                        hideRightMenu: false,
+                        showReviewChanges: false,
+                        toolbarNoTabs: false,
+                        uiTheme: 'theme-classic-light',  // Prevent theme switching dialogs
+                        autosave: false  // Disable autosave completely
+                    },
+                    mode            : urlParams["mode"] || 'edit',
+                    lang            : urlParams["lang"] || 'en',
+                    createUrl       : 'desktop://create.new',
+                    user: {
+                        id: urlParams["userid"] || urlParams["username"] || 'uid-901',
+                        name: urlParams["username"] || 'OfflineUser'
+                    }
+                };
+            }
+
+            function onInternalMessage(event) {
+                let info = event.data;
+                if ( info.type == 'goback' ) {
+                    if ( window.AscDesktopEditor ) {
+                        window.AscDesktopEditor.execCommand('go:folder', info.data.status);
+                    }
+                }
+            }
+
+            // Fetch the CONVERTED binary from the server (ONLYOFFICE binary format)
+            // Support 'url' parameter for proper mode
+            var binaryUrl = urlParams['url'] || ('/api/convert/' + filename);
+            console.log('Fetching converted binary from:', binaryUrl);
+
+            PERF.fetchStart = performance.now();
+            fetch(binaryUrl)
+                .then(function(response) {
+                    if (!response.ok) {
+                        throw new Error('Failed to fetch: ' + response.status);
+                    }
+                    console.log('Binary fetch successful, reading as ArrayBuffer...');
+
+                    // Capture the file hash from the response header
+                    var fileHash = response.headers.get('X-File-Hash');
+                    if (fileHash) {
+                        console.log('File hash received from server:', fileHash);
+                        window._ONLYOFFICE_FILE_HASH = fileHash;
+                        window._ONLYOFFICE_DOC_BASE_URL = `${SERVER_BASE_URL}/api/doc-base/${fileHash}`;
+                    } else {
+                        console.warn('No X-File-Hash header in response');
+                        window._ONLYOFFICE_DOC_BASE_URL = null;
+                    }
+
+                    return response.arrayBuffer();
+                })
+                .then(function(arrayBuffer) {
+                    PERF.fetchEnd = performance.now();
+                    console.log('ArrayBuffer received, size:', arrayBuffer.byteLength, 'bytes');
+                    console.log('[TIMING] Fetch took:', (PERF.fetchEnd - PERF.fetchStart).toFixed(0), 'ms');
+
+                    // Store binary data globally for GetOpenedFile to access
+                    window._currentDocumentBinary = arrayBuffer;
+
+                    // Convert to base64 for DesktopOfflineAppDocumentEndLoad
+                    var uint8Array = new Uint8Array(arrayBuffer);
+                    var binaryString = '';
+                    for (var i = 0; i < uint8Array.length; i++) {
+                        binaryString += String.fromCharCode(uint8Array[i]);
+                    }
+                    var base64Data = btoa(binaryString);
+
+                    console.log('Base64 data length:', base64Data.length);
+                    console.log('Base64 preview:', base64Data.substring(0, 100) + '...');
+
+                    // Hide loading message, show placeholder
+                    document.getElementById('loading').style.display = 'none';
+                    document.getElementById('placeholder').style.display = 'block';
+
+                    // Initialize the editor
+                    console.log('Creating DocEditor...');
+                    var cfg = getEditorConfig(urlParams);
+                    var doc = getDocumentData(urlParams);
+
+                    var docEditor = new DocsAPI.DocEditor('placeholder', {
+                        type: urlParams['type'] || 'desktop',
+                        width: '100%',
+                        height: '100%',
+                        documentType: doctype,
+                        document: doc,
+                        editorConfig: cfg,
+                        events: {
+                            onInternalMessage: onInternalMessage,
+                            onRequestClose: function(e) {return 0;},
+                            onAppReady: function() {
+                                PERF.appReady = performance.now();
+                                console.log('=== EDITOR APP READY ===');
+                                console.log('[TIMING] App ready, waited:', (PERF.appReady - PERF.docEditorCreated).toFixed(0), 'ms since DocEditor created');
+
+                                // CRITICAL: Install window.native callbacks now that SDK is loaded
+                                if (window._installNativeCallbacks && !window._nativeCallbacksInstalled) {
+                                    console.log('[EDITOR] Installing window.native callbacks on appReady');
+                                    window._installNativeCallbacks();
+                                    window._nativeCallbacksInstalled = true;
+                                }
+
+                                // FIX: Set iframe ID if not set (for Playwright compatibility)
+                                setTimeout(function() { try {
+                                    var allIframes = document.querySelectorAll('iframe');
+                                    if (allIframes.length > 0 && !allIframes[0].id) {
+                                        allIframes[0].id = 'iframeEditor_placeholder';
+                                        console.log('[FIX] Set iframe ID to:', allIframes[0].id);
+                                    }
+                                } catch (e) { console.error('[FIX] Error setting iframe ID:', e); } }, 100);
+
+                                // NOTE(victor): Poll every 50ms instead of fixed 5s delay - SDK is usually ready immediately
+                                var SDK_POLL_INTERVAL = 50;
+                                var SDK_MAX_WAIT = 10000;
+                                var sdkPollStart = performance.now();
+
+                                function waitForSdkAndLoad() {
+                                    var elapsed = performance.now() - sdkPollStart;
+
+                                    var allIframes = document.querySelectorAll('iframe');
+                                    var iframe = document.querySelector('iframe[id*="placeholder"]') ||
+                                                 document.querySelector('iframe[id*="frameEditor"]') ||
+                                                 allIframes[0];
+
+                                    if (!iframe) {
+                                        if (elapsed < SDK_MAX_WAIT) {
+                                            setTimeout(waitForSdkAndLoad, SDK_POLL_INTERVAL);
+                                        } else {
+                                            console.error('Editor iframe not found after', SDK_MAX_WAIT, 'ms');
+                                        }
+                                        return;
+                                    }
+
+                                    try {
+                                        var iframeWindow = iframe.contentWindow;
+                                        var iframeDoc = iframe.contentDocument || iframeWindow.document;
+
+									// NOTE(victor): Each editor type defines a DIFFERENT API class on Asc:
+                                        //   Word/PDF:      Asc.asc_docs_api    (word/sdk-all-min.js:1757)
+                                        //   Spreadsheet:   Asc.spreadsheet_api  (cell/sdk-all-min.js:1887)
+                                        //   Presentation:  Asc.asc_docs_api     (slide/sdk-all-min.js:1714)
+                                        //   Visio:         Asc.VisioEditorApi
+                                        // The SDK itself uses this 3-way fallback (cell/sdk-all.js:18255):
+                                        //   (Asc.asc_docs_api || Asc.spreadsheet_api || Asc.VisioEditorApi)
+                                        // If this check only tests asc_docs_api, it ALWAYS times out for
+                                        // spreadsheets, so our patched common.js never gets injected, and
+                                        // _ONLYOFFICE_FILE_HASH / _ONLYOFFICE_DOC_BASE_URL are never set
+                                        // in the iframe -- breaking media/image URL resolution.
+                                        var sdkReady = iframeWindow.AscCommon &&
+                                                       iframeWindow.Asc &&
+                                                       (iframeWindow.Asc.asc_docs_api ||
+                                                        iframeWindow.Asc.spreadsheet_api ||
+                                                        iframeWindow.Asc.VisioEditorApi);
+
+                                        if (!sdkReady) {
+                                            if (elapsed < SDK_MAX_WAIT) {
+                                                setTimeout(waitForSdkAndLoad, SDK_POLL_INTERVAL);
+                                            } else {
+                                                console.error('SDK not fully ready after', SDK_MAX_WAIT, 'ms');
+                                                console.log('  AscCommon:', !!iframeWindow.AscCommon);
+                                                console.log('  Asc:', !!iframeWindow.Asc);
+                                                console.log('  asc_docs_api:', !!(iframeWindow.Asc && iframeWindow.Asc.asc_docs_api));
+                                                console.log('  spreadsheet_api:', !!(iframeWindow.Asc && iframeWindow.Asc.spreadsheet_api));
+                                                console.log('  VisioEditorApi:', !!(iframeWindow.Asc && iframeWindow.Asc.VisioEditorApi));
+                                            }
+                                            return;
+                                        }
+
+                                        console.log('Found editor iframe:', iframe.id);
+                                        console.log('SDK fully ready after', elapsed.toFixed(0), 'ms');
+                                        console.log('  Asc:', typeof iframeWindow.Asc);
+                                        console.log('  AscCommon:', typeof iframeWindow.AscCommon);
+                                        console.log('  editor:', typeof iframeWindow.editor);
+
+                                        console.log('Loading common.js into iframe...');
+                                        PERF.commonJsLoadStart = performance.now();
+                                        console.log('[TIMING] SDK wait delay was:', (PERF.commonJsLoadStart - PERF.waitForSdkStart).toFixed(0), 'ms');
+
+                                        // Load common.js in the iframe
+                                        var commonScript = iframeDoc.createElement('script');
+                                        commonScript.src = '/sdkjs/common/Local/common.js';
+                                        commonScript.onload = function() {
+                                            PERF.commonJsLoadEnd = performance.now();
+                                            console.log('common.js loaded in iframe successfully');
+                                            console.log('[TIMING] common.js load took:', (PERF.commonJsLoadEnd - PERF.commonJsLoadStart).toFixed(0), 'ms');
+
+                                            // Copy document data to iframe window for LocalStartOpen to access
+                                            iframeWindow._currentDocumentBinary = window._currentDocumentBinary;
+                                            iframeWindow._ONLYOFFICE_FILENAME = window._ONLYOFFICE_FILENAME;
+                                            iframeWindow._ONLYOFFICE_FILEPATH = window._ONLYOFFICE_FILEPATH;
+                                            iframeWindow._ONLYOFFICE_FILE_HASH = window._ONLYOFFICE_FILE_HASH;
+                                            iframeWindow._ONLYOFFICE_DOC_BASE_URL = window._ONLYOFFICE_DOC_BASE_URL;
+                                            console.log('[LOADER] Copied document data to iframe:');
+                                            console.log('  filename:', iframeWindow._ONLYOFFICE_FILENAME);
+                                            console.log('  filepath:', iframeWindow._ONLYOFFICE_FILEPATH);
+                                            console.log('  fileHash:', iframeWindow._ONLYOFFICE_FILE_HASH);
+                                            console.log('  binarySize:', window._currentDocumentBinary ? window._currentDocumentBinary.byteLength : 0);
+
+                                            // Initialize image cache in iframe
+                                            if (!iframeWindow._imageCache) {
+                                                iframeWindow._imageCache = {};
+                                            }
+
+                                            // Pre-load images for presentations (async, doesn't block loading)
+                                            if (iframeWindow._ONLYOFFICE_FILE_HASH) {
+                                                console.log('[IMAGE-PRELOAD] Starting image pre-load...');
+                                                fetch('/api/media-list/' + iframeWindow._ONLYOFFICE_FILE_HASH)
+                                                    .then(function(res) { return res.json(); })
+                                                    .then(function(imageList) {
+                                                        console.log('[IMAGE-PRELOAD] Found', imageList.length, 'images');
+                                                        imageList.forEach(function(imageName) {
+                                                            var imageUrl = SERVER_BASE_URL + '/api/media/' +
+                                                                          iframeWindow._ONLYOFFICE_FILE_HASH + '/' +
+                                                                          encodeURIComponent(imageName);
+                                                            fetch(imageUrl)
+                                                                .then(function(res) { return res.blob(); })
+                                                                .then(function(blob) {
+                                                                    var reader = new FileReader();
+                                                                    reader.onloadend = function() {
+                                                                        var cacheKeys = [
+                                                                            'media/' + imageName,
+                                                                            './media/' + imageName,
+                                                                            filename + '/media/' + imageName
+                                                                        ];
+                                                                        if (window._ONLYOFFICE_DOC_BASE_URL) {
+                                                                            cacheKeys.push(window._ONLYOFFICE_DOC_BASE_URL + '/media/' + imageName);
+                                                                        }
+                                                                        cacheKeys.forEach(function(key) {
+                                                                            window._imageCache[key] = reader.result;
+                                                                            iframeWindow._imageCache[key] = reader.result;
+                                                                        });
+                                                                    };
+                                                                    reader.readAsDataURL(blob);
+                                                                })
+                                                                .catch(function(err) { console.error('[IMAGE-PRELOAD] Error:', imageName, err); });
+                                                        });
+                                                    })
+                                                    .catch(function(err) { console.error('[IMAGE-PRELOAD] Error getting list:', err); });
+                                            }
+
+                                            // Install image URL interceptor for file:// URLs
+                                            try {
+                                                var originalSrcDesc = Object.getOwnPropertyDescriptor(iframeWindow.HTMLImageElement.prototype, 'src');
+                                                if (originalSrcDesc && originalSrcDesc.set) {
+                                                    Object.defineProperty(iframeWindow.HTMLImageElement.prototype, 'src', {
+                                                        get: originalSrcDesc.get,
+                                                        set: function(value) {
+                                                            if (value && typeof value === 'string' && value.indexOf('file://') === 0) {
+                                                                if (window.AscDesktopEditor && window.AscDesktopEditor.LocalFileGetImageUrlCorrect) {
+                                                                    value = window.AscDesktopEditor.LocalFileGetImageUrlCorrect(value);
+                                                                }
+                                                            }
+                                                            originalSrcDesc.set.call(this, value);
+                                                        },
+                                                        configurable: true,
+                                                        enumerable: true
+                                                    });
+                                                }
+                                            } catch (e) {
+                                                console.warn('[LOADER] Could not install image interceptor:', e);
+                                            }
+
+                                            // ARCHITECTURE: SDK will call LocalStartOpen() when ready
+                                            // LocalStartOpen() (in desktop-stub.js) will then call DesktopOfflineAppDocumentEndLoad()
+                                            // This is event-driven, no polling needed!
+                                            console.log('[LOADER] common.js loaded, SDK will call LocalStartOpen() when ready');
+                                            PERF.documentEndLoadCalled = performance.now();
+                                        };
+                                        commonScript.onerror = function(e) {
+                                            console.error('Failed to load common.js in iframe:', e);
+                                        };
+                                        iframeDoc.head.appendChild(commonScript);
+                                    } catch (e) {
+                                        console.error('Error accessing iframe:', e);
+                                    }
+                                }
+
+                                PERF.waitForSdkStart = performance.now();
+                                console.log('[TIMING] Starting SDK polling (50ms intervals, max 10s)');
+                                waitForSdkAndLoad();
+                            },
+                            onDocumentReady: function() {
+                                PERF.documentReady = performance.now();
+                                console.log('=== DOCUMENT READY ===');
+                                console.log('[TIMING] Document ready! Total time:', (PERF.documentReady - PERF.loaderStart).toFixed(0), 'ms');
+                                logTimings();
+
+                                // CRITICAL FIX: Initialize change tracking to stop infinite polling
+                                // The SDK polls LocalFileGetSaved() and LocalFileGetOpenChangesCount()
+                                // waiting for the document to be in a "saved" state. We need to:
+                                // 1. Call LocalFileSaveChanges([]) to initialize empty change tracking
+                                // 2. Mark the document as loaded and saved
+                                console.log('[FIX] Initializing change tracking to stop infinite polling...');
+
+                                if (window.AscDesktopEditor && window.AscDesktopEditor.LocalFileSaveChanges) {
+                                    // Initialize empty change tracking - this tells SDK there are no pending changes
+                                    window.AscDesktopEditor.LocalFileSaveChanges([], 0, 0);
+                                    console.log('[FIX] Called LocalFileSaveChanges([], 0, 0) to initialize tracking');
+                                }
+
+                                // Mark document as loaded and saved
+                                window._documentLoaded = true;
+                                window._hasUnsavedChanges = false;
+                                window._documentModified = false;  // Track modifications for LocalFileSave
+                                window._documentReadyTime = Date.now();  // Track when document finished loading
+                                console.log('[FIX] Set _documentLoaded=true, _hasUnsavedChanges=false, _documentModified=false');
+
+                                // Call onDocumentContentReady to signal the document is fully loaded
+                                if (window.AscDesktopEditor && window.AscDesktopEditor.onDocumentContentReady) {
+                                    window.AscDesktopEditor.onDocumentContentReady();
+                                    console.log('[FIX] Called onDocumentContentReady()');
+                                }
+
+                                // ========================================================
+                                // SCROLL RESTORATION AND TRACKING
+                                // ========================================================
+                                setTimeout(function() { try {
+                                    var iframe = document.querySelector('iframe[id*="placeholder"]') ||
+                                                document.querySelector('iframe[id*="frameEditor"]') ||
+                                                document.querySelector('iframe');
+                                    if (!iframe || !iframe.contentWindow) {
+                                        console.log('[SCROLL] No iframe found for scroll restoration');
+                                        return;
+                                    }
+
+                                    var iframeWindow = iframe.contentWindow;
+                                    var api = iframeWindow.Asc && iframeWindow.Asc.editor;
+
+                                    // Restore pending scroll position
+                                    if (pendingScrollState && api) {
+                                        console.log('[SCROLL] Restoring scroll position:', JSON.stringify(pendingScrollState));
+                                        try {
+                                            switch (pendingScrollState.type) {
+                                                case 'cell':
+                                                    // Switch sheet if needed
+                                                    if (pendingScrollState.sheet > 0 && api.asc_showWorksheet) {
+                                                        api.asc_showWorksheet(pendingScrollState.sheet);
+                                                    }
+                                                    // Navigate to cell
+                                                    if (api.asc_findCell) {
+                                                        api.asc_findCell(pendingScrollState.cell);
+                                                        console.log('[SCROLL] Navigated to cell:', pendingScrollState.cell);
+                                                    }
+                                                    break;
+                                                case 'page':
+                                                    if (api.goToPage) {
+                                                        api.goToPage(pendingScrollState.page - 1); // 0-indexed
+                                                        console.log('[SCROLL] Navigated to page:', pendingScrollState.page);
+                                                    }
+                                                    break;
+                                                case 'slide':
+                                                    if (api.goToSlide) {
+                                                        api.goToSlide(pendingScrollState.slide - 1); // 0-indexed
+                                                        console.log('[SCROLL] Navigated to slide:', pendingScrollState.slide);
+                                                    }
+                                                    break;
+                                            }
+                                        } catch (e) {
+                                            console.error('[SCROLL] Error restoring scroll:', e);
+                                        }
+                                    }
+
+                                    // Set up navigation tracking to update URL
+                                    console.log('[SCROLL] Setting up navigation tracking for doctype:', doctype);
+
+                                    // Debounce URL updates
+                                    var urlUpdateTimeout = null;
+                                    function debouncedUrlUpdate(scrollState) {
+                                        if (urlUpdateTimeout) clearTimeout(urlUpdateTimeout);
+                                        urlUpdateTimeout = setTimeout(function() {
+                                            updateUrlWithScroll(scrollState);
+                                        }, 500);
+                                    }
+
+                                    if (doctype === 'cell' && api) {
+                                        // Log available API methods for cell reference
+                                        var apiMethods = Object.keys(api).filter(function(k) {
+                                            return k.toLowerCase().includes('cell') || k.toLowerCase().includes('select') || k.toLowerCase().includes('active');
+                                        });
+                                        console.log('[SCROLL] API methods related to cell/select/active:', apiMethods.join(', '));
+
+                                        // Track cell selection changes
+                                        if (api.asc_registerCallback) {
+                                            api.asc_registerCallback('asc_onSelectionChanged', function(cellInfo) {
+                                                // Get cell reference from the API directly instead of cellInfo
+                                                var cellRef = null;
+
+                                                // Try to get active cell from api.asc_getCellInfo or similar
+                                                if (api.asc_getCellInfo) {
+                                                    var info = api.asc_getCellInfo();
+                                                    if (info && info.asc_getName) {
+                                                        cellRef = info.asc_getName();
+                                                    }
+                                                }
+
+                                                // Try getting from selection name directly
+                                                if (!cellRef && api.asc_getActiveRangeStr) {
+                                                    cellRef = api.asc_getActiveRangeStr();
+                                                }
+
+                                                // Try workbook/worksheet approach
+                                                if (!cellRef && api.wb) {
+                                                    var ws = api.wb.getWorksheet();
+                                                    if (ws && ws.getSelectionRangeStr) {
+                                                        cellRef = ws.getSelectionRangeStr();
+                                                    } else if (ws && ws.model && ws.model.selectionRange) {
+                                                        var sel = ws.model.selectionRange;
+                                                        if (sel.getName) cellRef = sel.getName();
+                                                    }
+                                                }
+
+                                                // Try getting from selection model
+                                                if (!cellRef && iframeWindow.AscCommonExcel) {
+                                                    var wbModel = api.wbModel || api.asc_getModel && api.asc_getModel();
+                                                    if (wbModel) {
+                                                        var activeWs = wbModel.getActiveWs ? wbModel.getActiveWs() : null;
+                                                        if (activeWs && activeWs.selectionRange) {
+                                                            var range = activeWs.selectionRange.getLast();
+                                                            if (range) {
+                                                                // Convert to A1 notation
+                                                                var col = range.c1;
+                                                                var row = range.r1;
+                                                                var colStr = '';
+                                                                var c = col;
+                                                                do {
+                                                                    colStr = String.fromCharCode(65 + (c % 26)) + colStr;
+                                                                    c = Math.floor(c / 26) - 1;
+                                                                } while (c >= 0);
+                                                                cellRef = colStr + (row + 1);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+
+                                                console.log('[SCROLL] Extracted cellRef:', cellRef);
+
+                                                var sheetIndex = 0;
+                                                if (api.asc_getActiveWorksheetIndex) {
+                                                    sheetIndex = api.asc_getActiveWorksheetIndex();
+                                                } else if (api.getActiveWorksheetIndex) {
+                                                    sheetIndex = api.getActiveWorksheetIndex();
+                                                }
+
+                                                if (cellRef) {
+                                                    debouncedUrlUpdate({
+                                                        type: 'cell',
+                                                        cell: cellRef,
+                                                        sheet: sheetIndex
+                                                    });
+                                                }
+                                            });
+                                            console.log('[SCROLL] Registered cell selection callback');
+                                        }
+                                    } else if (doctype === 'word' && api) {
+                                        // Track page changes
+                                        if (api.asc_registerCallback) {
+                                            api.asc_registerCallback('asc_onCurrentPage', function(pageNum) {
+                                                debouncedUrlUpdate({
+                                                    type: 'page',
+                                                    page: pageNum + 1 // 1-indexed for URL
+                                                });
+                                            });
+                                            console.log('[SCROLL] Registered page change callback');
+                                        }
+                                    } else if (doctype === 'slide' && api) {
+                                        // Track slide changes via polling since callbacks may not fire
+                                        var lastSlide = -1;
+                                        function pollCurrentSlide() {
+                                            var currentSlide = null;
+                                            // Try different ways to get current slide
+                                            if (api.GetCurrentSlideIndex) {
+                                                currentSlide = api.GetCurrentSlideIndex();
+                                            } else if (api.asc_GetCurrentSlideIndex) {
+                                                currentSlide = api.asc_GetCurrentSlideIndex();
+                                            } else if (iframeWindow.editor && iframeWindow.editor.WordControl) {
+                                                var wc = iframeWindow.editor.WordControl;
+                                                if (wc.m_oLogicDocument && wc.m_oLogicDocument.CurPage !== undefined) {
+                                                    currentSlide = wc.m_oLogicDocument.CurPage;
+                                                }
+                                            }
+
+                                            if (currentSlide !== null && currentSlide !== lastSlide) {
+                                                console.log('[SCROLL] Slide changed to:', currentSlide);
+                                                lastSlide = currentSlide;
+                                                debouncedUrlUpdate({
+                                                    type: 'slide',
+                                                    slide: currentSlide + 1
+                                                });
+                                            }
+                                        }
+                                        // Poll every 500ms
+                                        setInterval(pollCurrentSlide, 500);
+                                        pollCurrentSlide(); // Initial check
+                                        console.log('[SCROLL] Started slide polling');
+                                    }
+                                } catch (e) { console.error('[SCROLL] Error in scroll restoration:', e); } }, 500); // Small delay to ensure API is fully initialized
+                            },
+                            onDocumentModifiedChanged: function(modified) {
+                                console.log('[BROWSER] onDocumentModifiedChanged:', modified, 'userHasEdited:', window._userHasEdited, 'documentChanges:', window._documentChanges ? window._documentChanges.length : 0);
+
+                                // Track when user actually modifies the document
+                                // Once modified = true, set a flag that prevents false from being accepted
+                                if (modified === true) {
+                                    window._documentModified = true;
+                                    window._hasUnsavedChanges = true;
+                                    window._userHasEdited = true;  // Flag that user has made edits
+                                    console.log('[BROWSER] _documentModified set to: true (user made changes)');
+                                } else if (modified === false) {
+                                    // Check if we have unsaved changes in the document
+                                    var hasChanges = window._documentChanges && window._documentChanges.length > 0;
+
+                                    // Only accept false if user hasn't edited AND there are no stored changes
+                                    if (!window._userHasEdited && !hasChanges) {
+                                        window._documentModified = false;
+                                        window._hasUnsavedChanges = false;
+                                        console.log('[BROWSER] _documentModified set to: false (initialization, no changes)');
+                                    } else {
+                                        console.log('[BROWSER] Ignoring false - user has edited or has pending changes');
+                                        // Keep the modified flag true
+                                        window._documentModified = true;
+                                        window._hasUnsavedChanges = true;
+                                    }
+                                }
+                            },
+                            onError: function(event) {
+                                // Check all possible error code locations
+                                var errorCode = null;
+                                if (event.data && typeof event.data === 'object') {
+                                    errorCode = event.data.errorCode !== undefined ? event.data.errorCode :
+                                                event.data.errorId !== undefined ? event.data.errorId : null;
+                                } else if (typeof event.data === 'string') {
+                                    try {
+                                        var parsed = JSON.parse(event.data);
+                                        errorCode = parsed.errorCode !== undefined ? parsed.errorCode :
+                                                   parsed.errorId !== undefined ? parsed.errorId : null;
+                                    } catch(e) {
+                                        // Not JSON
+                                    }
+                                }
+                                // Also check event directly
+                                if (errorCode === null) {
+                                    errorCode = event.errorCode !== undefined ? event.errorCode : event.errorId;
+                                }
+
+                                // Suppress error -82 (false positive during offline loading)
+                                // This error occurs when loading from binary_content:// but is expected
+                                if (errorCode === -82) {
+                                    console.log('[SUPPRESSED] Error -82 is expected during offline loading - document loaded successfully');
+
+                                    // The SDK shows the error dialog before calling onError, so we need to hide it
+                                    // Find and hide the error dialog in the iframe
+                                    setTimeout(function() {
+                                        try {
+                                            var iframe = document.querySelector('iframe[id*="placeholder"]') ||
+                                                        document.querySelector('iframe[id*="frameEditor"]') ||
+                                                        document.querySelector('iframe');
+
+                                            if (iframe && iframe.contentDocument) {
+                                                var iframeDoc = iframe.contentDocument;
+
+                                                // Find error dialogs - try multiple selectors
+                                                var errorDialogs = iframeDoc.querySelectorAll('.asc-window.alert, .error-dialog, [role="dialog"]');
+
+                                                errorDialogs.forEach(function(dialog) {
+                                                    var dialogText = dialog.textContent || dialog.innerText;
+                                                    if (dialogText.includes('An error has occurred while opening the file') ||
+                                                        dialogText.includes('error') || dialogText.includes('Error')) {
+                                                        dialog.style.display = 'none';
+                                                        console.log('[SUPPRESSED] Hid error dialog in iframe');
+
+                                                        // Also hide any modal overlays
+                                                        var modals = iframeDoc.querySelectorAll('.modal-backdrop, .asc-window-background');
+                                                        modals.forEach(function(modal) {
+                                                            modal.style.display = 'none';
+                                                        });
+                                                    }
+                                                });
+                                            }
+                                        } catch(e) {
+                                            console.log('[SUPPRESSED] Could not access iframe to hide dialog:', e.message);
+                                        }
+                                    }, 100); // Small delay to let dialog render
+
+                                    return false;
+                                }
+
+                                // Only show errors that aren't suppressed
+                                console.error('=== UNHANDLED EDITOR ERROR ===');
+                                console.error('Error code:', errorCode);
+                                console.error('Error data:', JSON.stringify(event.data || event));
+                                console.error('Error description:', event.data?.errorDescription);
+                            }
+                        }
+                    });
+
+                    window.docEditor = docEditor;
+                    PERF.docEditorCreated = performance.now();
+                    console.log('DocEditor created:', docEditor);
+                    console.log('[TIMING] DocEditor creation took:', (PERF.docEditorCreated - PERF.fetchEnd).toFixed(0), 'ms');
+                })
+                .catch(function(error) {
+                    console.error('Error loading document:', error);
+                    document.getElementById('loading').innerHTML = 'Error: ' + error.message;
+                });
+
+        })();
+    </script>
+</body>
+</html>

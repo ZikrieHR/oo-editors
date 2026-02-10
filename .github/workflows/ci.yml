@@ -1,0 +1,135 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-sdk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Cache SDK build
+        id: sdk-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            editors/sdkjs/cell/sdk-all.js
+            editors/sdkjs/cell/sdk-all-min.js
+            editors/sdkjs/word/sdk-all.js
+            editors/sdkjs/word/sdk-all-min.js
+            editors/sdkjs/slide/sdk-all.js
+            editors/sdkjs/slide/sdk-all-min.js
+            editors/sdkjs/visio/sdk-all.js
+            editors/sdkjs/visio/sdk-all-min.js
+          key: sdk-build-${{ hashFiles('sdkjs/common/**/*.js', 'sdkjs/cell/**/*.js', 'sdkjs/word/**/*.js', 'sdkjs/slide/**/*.js', 'sdkjs/visio/**/*.js', 'sdkjs/build/Gruntfile.js') }}
+
+      - name: Build SDK
+        if: steps.sdk-cache.outputs.cache-hit != 'true'
+        run: bun run build
+
+      - name: Upload SDK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdk-build
+          path: |
+            editors/sdkjs/cell/sdk-all.js
+            editors/sdkjs/cell/sdk-all-min.js
+            editors/sdkjs/word/sdk-all.js
+            editors/sdkjs/word/sdk-all-min.js
+            editors/sdkjs/slide/sdk-all.js
+            editors/sdkjs/slide/sdk-all-min.js
+            editors/sdkjs/visio/sdk-all.js
+            editors/sdkjs/visio/sdk-all-min.js
+
+  test:
+    needs: build-sdk
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            test-cmd: bun run test:unit
+          - os: macos-latest
+            test-cmd: bun run test:all
+          - os: depot-windows-2022-16
+            test-cmd: bun run test:all
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Download SDK build
+        uses: actions/download-artifact@v4
+        with:
+          name: sdk-build
+          path: editors/sdkjs
+
+      - name: Install Playwright browsers
+        if: matrix.os != 'ubuntu-latest'
+        run: bunx playwright install chromium
+
+      - name: Cache converter
+        if: matrix.os != 'ubuntu-latest'
+        uses: actions/cache@v4
+        with:
+          path: converter
+          key: converter-${{ runner.os }}-${{ runner.arch }}-v9.1.0
+
+      - name: Setup server (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          bun download-converter.js
+          bun scripts/build_allfontsgen.js
+          FONT_DATA_DIR=assets/onlyoffice-fontdata bun ./scripts/generate_office_fonts.js
+
+      - name: Setup server (Windows)
+        if: matrix.os == 'depot-windows-2022-16'
+        shell: pwsh
+        run: |
+          bun download-converter.js
+          bun scripts/build_allfontsgen.js
+          $env:FONT_DATA_DIR="assets/onlyoffice-fontdata"; bun ./scripts/generate_office_fonts.js
+
+      - name: Start server (macOS)
+        if: matrix.os == 'macos-latest'
+        run: FONT_DATA_DIR=assets/onlyoffice-fontdata bun server.js &
+
+      - name: Start server (Windows)
+        if: matrix.os == 'depot-windows-2022-16'
+        env:
+          FONT_DATA_DIR: assets/onlyoffice-fontdata
+        run: cmd /c "start /b bun server.js"
+
+      - name: Wait for server
+        if: matrix.os != 'ubuntu-latest'
+        shell: bash
+        run: |
+          for i in {1..30}; do
+            curl -s http://localhost:8080 > /dev/null && break
+            sleep 1
+          done
+
+      - name: Run tests
+        run: ${{ matrix.test-cmd }}
+
+      - name: Verify server compiles
+        run: bunx esbuild server.js --minify --outfile=dist/server.js
+
+      - name: Verify build output
+        shell: bash
+        run: |
+          test -f dist/server.js || (echo "Build failed: dist/server.js not found" && exit 1)
+          echo "Build successful: dist/server.js exists ($(wc -c < dist/server.js) bytes)"

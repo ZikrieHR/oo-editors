@@ -1,0 +1,42 @@
+# Dependencies
+node_modules
+
+# Logs
+*.log
+
+# Test artifacts - generated test files
+test-files/*.docx
+test-files/*.pptx
+test-files/*.xlsx
+test-files/*.pdf
+
+# IDE/Editor configs
+.workstationreborn/
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+test/output
+dev_error_log.txt
+assets/onlyoffice-fontdata/
+converter
+DesktopEditors
+dist
+*.bun-build
+
+# Upstream sdkjs artifacts not needed
+sdkjs/tests/
+sdkjs/.github/
+
+# SDK compiled bundles (built from sdkjs/ source via grunt --desktop=true)
+editors/sdkjs/cell/sdk-all.js
+editors/sdkjs/cell/sdk-all-min.js
+editors/sdkjs/word/sdk-all.js
+editors/sdkjs/word/sdk-all-min.js
+editors/sdkjs/slide/sdk-all.js
+editors/sdkjs/slide/sdk-all-min.js
+editors/sdkjs/visio/sdk-all.js
+editors/sdkjs/visio/sdk-all-min.js
+sdkjs/deploy/
