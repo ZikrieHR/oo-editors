@@ -59,7 +59,7 @@ jobs:
             test-cmd: bun run test:unit
           - os: macos-latest
             test-cmd: bun run test:all
-          - os: depot-windows-2022-16
+          - os: windows-latest
             test-cmd: bun run test:all
     runs-on: ${{ matrix.os }}
     steps:
@@ -96,18 +96,12 @@ jobs:
           FONT_DATA_DIR=assets/onlyoffice-fontdata bun ./scripts/generate_office_fonts.js
 
       - name: Setup server (Windows)
-        if: matrix.os == 'depot-windows-2022-16'
+        if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
           bun download-converter.js
-          curl -L -o vc_redist.x64.exe https://aka.ms/vs/17/release/vc_redist.x64.exe
-          Start-Process -FilePath .\vc_redist.x64.exe -ArgumentList '/install','/quiet','/norestart' -Wait
-          $dlls = Get-ChildItem "$env:SystemRoot\System32" -Include 'vcruntime140*.dll','msvcp140*.dll','concrt140.dll','vcomp140.dll' -Recurse
-          foreach ($dll in $dlls) {
-            Copy-Item $dll.FullName "converter\$($dll.Name)"
-            Write-Output "Bundled $($dll.Name) ($($dll.Length) bytes)"
-          }
-          Remove-Item vc_redist.x64.exe
+          Copy-Item vendor/vcruntime/*.dll converter/
+          Get-ChildItem converter/*.dll | ForEach-Object { Write-Output "Bundled $($_.Name) ($($_.Length) bytes)" }
           bun scripts/build_allfontsgen.js
           $env:FONT_DATA_DIR="assets/onlyoffice-fontdata"; bun ./scripts/generate_office_fonts.js
 
@@ -116,7 +110,7 @@ jobs:
         run: FONT_DATA_DIR=assets/onlyoffice-fontdata bun server.js &
 
       - name: Start server (Windows)
-        if: matrix.os == 'depot-windows-2022-16'
+        if: matrix.os == 'windows-latest'
         env:
           FONT_DATA_DIR: assets/onlyoffice-fontdata
         run: cmd /c "start /b bun server.js"
